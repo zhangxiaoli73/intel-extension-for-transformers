@@ -20,7 +20,6 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     # AutoModel,
-    GPTJForCausalLM,
     LlamaForCausalLM,
     T5ForConditionalGeneration,
     AutoTokenizer,
@@ -30,10 +29,11 @@ from transformers import (
 
 # supported models now
 MODEL_CLASSES = {
-    "gpt": (GPTJForCausalLM, AutoTokenizer),
+    "gpt-j": (AutoModelForCausalLM, AutoTokenizer),
+    "gpt-neox": (AutoModelForCausalLM, AutoTokenizer),
     "opt": (AutoModelForCausalLM, AutoTokenizer),
     "bloom": (AutoModelForCausalLM, AutoTokenizer),
-    "llama": (AutoModelForCausalLM, LlamaTokenizer),
+    "llama": (LlamaForCausalLM, LlamaTokenizer),
     "t5": (T5ForConditionalGeneration, AutoTokenizer),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
     # "chatglm": (AutoModel, AutoTokenizer),
@@ -58,7 +58,7 @@ parser.add_argument('--device',
     default='cpu',
 )
 parser.add_argument(
-    "--dtype", type=str, help="float16 or bfloat16 or int8", choices=["int8", "float16", "bfloat16"], default="float16"
+    "--dtype", type=str, help="float16 or bfloat16 or int8", choices=["int8", "float16", "bfloat16", "float32"], default="float16"
 )
 parser.add_argument("--local_rank", required=False, type=int, help="used by dist launchers")
 parser.add_argument("--batch_size", "--batch-size", default=1, type=int, help="batch size")
@@ -161,6 +161,9 @@ elif args.dtype == "bfloat16":
 elif args.dtype == "int8":
     load_dtype = torch.half
     infer_dtype = torch.int8
+elif args.dtype == "float32":
+    load_dtype = torch.float32
+    infer_dtype = torch.float32
 
 tp_presharded_mode = True if model_name in tp_presharded_models else False
 
@@ -170,7 +173,9 @@ print_rank0(f"*** Loading the model {model_name}")
 model_type = next((x for x in MODEL_CLASSES.keys() if x in model_name.lower()), 'auto')
 model_class = MODEL_CLASSES[model_type]
 tokenizer = model_class[1].from_pretrained(model_name)
-config = AutoConfig.from_pretrained(model_name)
+config = AutoConfig.from_pretrained(model_name, torchscript=args.jit)
+if not hasattr(config, "text_max_length") and args.prompt is None:
+    config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
 
 # XXX: can't automatically derive dtype via config's `from_pretrained`
 # dtype = torch.bfloat16 if model_name in ["bigscience/bloom", "bigscience/bigscience-small-testing"] else torch.float16
@@ -188,10 +193,13 @@ if args.benchmark:
 
 # Construct model with fake meta tensors, later will be replaced during ds-inference ckpt load
 with deepspeed.OnDevice(dtype=load_dtype, device="meta"):
-    if model_type in ["gpt"]:
-        model = model_class[0].from_pretrained(model_name, torch_dtype=load_dtype)
+    # Even inside the meta device context, from_pretrained still loads the
+    # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
+    # We add the instance type check here since some of the models haven't yet supported from_config.
+    if model_class[0] == AutoModelForCausalLM:
+        model = model_class[0].from_config(config).to(load_dtype)
     else:
-        model = model_class[0].from_config(config, torch_dtype=load_dtype)
+        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
@@ -273,6 +281,8 @@ if args.prompt is not None:
     input_sentences.append(args.prompt)
 elif model_type == "auto":
     raise SystemExit("[ERROR] model prompt is not supported, please use --prompt for this model: " + args.model_id)
+elif int(args.input_tokens) > 8192:
+    prompt = prompt_pool[model_type]["8192"] * int(int(args.input_tokens) / 8192)
 elif args.input_tokens in prompt_pool[model_type]:
     input_sentences.append(prompt_pool[model_type][args.input_tokens])
 else:
@@ -293,34 +303,28 @@ print_rank0(f"Generate args {generate_kwargs}")
 
 
 inputs = input_sentences[: args.batch_size]
-#input_size = tokenizer.batch_encode_plus(inputs, return_tensors="pt", padding=True).input_ids.size(dim=1)
-input_size = tokenizer(inputs, return_tensors="pt").input_ids.size(dim=1)
+input_size = tokenizer.batch_encode_plus(inputs, return_tensors="pt").input_ids.size(dim=1)
 print_rank0("*** Prompt size: ", input_size)
 
 
 def generate():
     """returns a list of zipped inputs, outputs and number of new tokens"""
 
-    if model_type in ["gpt", "llama"]:
-        input_tokens = tokenizer(inputs, return_tensors="pt").input_ids.to(get_accelerator().current_device_name())
-        input_tokens = [input_tokens]
-        gen_ids = model.generate(*input_tokens, **generate_kwargs)
-    else:
-        input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt", padding=True)
-        for t in input_tokens:
-            if torch.is_tensor(input_tokens[t]):
-                input_tokens[t] = input_tokens[t].to(get_accelerator().current_device_name())
+    input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt")
+    for t in input_tokens:
+        if torch.is_tensor(input_tokens[t]):
+            input_tokens[t] = input_tokens[t].to(get_accelerator().current_device_name())
 
-        gen_ids = model.generate(**input_tokens, **generate_kwargs)
-    outputs = gen_ids[0] if args.token_latency else gen_ids
+    outputs = model.generate(**input_tokens, **generate_kwargs)
+    gen_ids = outputs[0] if args.token_latency else outputs
 
-    input_tokens_lengths = []
-    output_tokens_lengths = []
+    input_tokens_lengths = [x.shape[0] for x in input_tokens.input_ids]
+    output_tokens_lengths = [x.shape[0] for x in gen_ids]
 
-    total_new_tokens = [o - i for i, o in zip(input_tokens_lengths, output_tokens_lengths)]
-    outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    total_new_tokens = [o - i if model.config.model_type != 't5' else o for i, o in zip(input_tokens_lengths, output_tokens_lengths)]
+    gen_text = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
-    return zip(inputs, outputs), gen_ids
+    return zip(inputs, gen_text, total_new_tokens), outputs
 
 
 # warmup is a must if measuring speed as it's when all the optimizations are performed
@@ -343,7 +347,7 @@ else:
     gc.collect()
     deepspeed.runtime.utils.see_memory_usage("end-of-run", force=True)
 
-    print("*** Running benchmark")
+    print_rank0("*** Running benchmark")
     total_time = 0.0
     cycles = args.num_iter
     warmup = args.num_warmup
@@ -351,16 +355,19 @@ else:
     # latency
     for i in range(cycles):
         t0 = time.time()
-        gen_text, gen_ids = generate()
+        gen_ids, outputs = generate()
         if args.cuda:
             torch.cuda.synchronize()
         t1 = time.time()
-        #print(f"------------------------------------------ finish iter{i}")
-        print_rank0(list(gen_text))
+        gen_ids = list(gen_ids)
+        print_rank0(gen_ids[0][1:])
+        print_rank0("Iteration: %d, Time: %.6f sec" % (i, t1 - t0))
+        # if model.config.model_type != 't5':
+        #     assert gen_ids[0][-1] == args.max_new_tokens, "Generated new tokens != max new tokens"
         if i >= warmup:
             total_time += (t1 - t0)
             if args.token_latency:
-                total_list.append(gen_ids[1])
+                total_list.append(outputs[1])
 
     latency = total_time / (cycles - warmup)
     print_rank0("\n", "-"*10, "Summary:", "-"*10)
@@ -381,6 +388,7 @@ else:
         print_rank0("Average 2... latency: %.3f sec." % average_2n_latency)
         print_rank0("P90 2... latency: %.3f sec." % p90_latency)
         print_rank0("P99 2... latency: %.3f sec." % p99_latency)
+    print_rank0(f"Generate args {generate_kwargs}")
     print_rank0(
         f"""
 *** Performance stats:
