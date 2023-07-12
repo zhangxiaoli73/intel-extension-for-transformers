@@ -197,7 +197,7 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta"):
     # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
     # We add the instance type check here since some of the models haven't yet supported from_config.
     if model_class[0] == AutoModelForCausalLM:
-        model = model_class[0].from_config(config).to(load_dtype)
+        model = model_class[0].from_config(config, torch_dtype=load_dtype)
     else:
         model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
@@ -257,19 +257,16 @@ if args.benchmark:
     gc.collect()
     deepspeed.runtime.utils.see_memory_usage("post-ds-inference-init", force=True)
 
-
-model = model.module
-
 if args.benchmark:
     t_ready = time.time()
 
 # to ipex
 if args.ipex:
-    model = ipex.optimize_transformers(model.eval(), dtype=infer_dtype)
+    model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype)
+else:
+    model = model.module
 
 ### Generate
-
-
 print_rank0(f"*** Starting to generate {num_tokens} tokens with bs={args.batch_size}")
 
 # input tokens
