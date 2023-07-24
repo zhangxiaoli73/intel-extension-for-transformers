@@ -118,6 +118,8 @@ def print_rank0(*msg):
 
 ### Model loading and instantiating on GPUs
 def get_repo_root(model_name_or_path):
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
     # checks if online or not
     if is_offline_mode():
         print_rank0("Offline mode: forcing local_files_only=True")
@@ -192,14 +194,14 @@ if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("pre-from-pretrained", force=True)
 
 # Construct model with fake meta tensors, later will be replaced during ds-inference ckpt load
-with deepspeed.OnDevice(dtype=load_dtype, device="meta"):
+with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=model_type != "llama"):
     # Even inside the meta device context, from_pretrained still loads the
     # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
     # We add the instance type check here since some of the models haven't yet supported from_config.
     if model_class[0] == AutoModelForCausalLM:
         model = model_class[0].from_config(config, torch_dtype=load_dtype)
     else:
-        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+        model = model_class[0].from_pretrained(model_name, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
@@ -248,9 +250,10 @@ model = deepspeed.init_inference(
     mp_size=world_size,
     base_dir=repo_root,
     dtype=infer_dtype,
-    checkpoint=checkpoints_json,
+    checkpoint=checkpoints_json if model_type != "llama" else None,
     **kwargs,
 )
+print_rank0("model config:", model.config)
 
 if args.benchmark:
     get_accelerator().empty_cache()
@@ -262,6 +265,7 @@ if args.benchmark:
 
 # to ipex
 if args.ipex:
+    args.greedy = True
     model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype)
 else:
     model = model.module
