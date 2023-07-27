@@ -21,6 +21,7 @@ from transformers import (
     AutoModelForCausalLM,
     # AutoModel,
     LlamaForCausalLM,
+    FalconForCausalLM,
     T5ForConditionalGeneration,
     AutoTokenizer,
     LlamaTokenizer,
@@ -35,6 +36,7 @@ MODEL_CLASSES = {
     "bloom": (AutoModelForCausalLM, AutoTokenizer),
     "llama": (LlamaForCausalLM, LlamaTokenizer),
     "t5": (T5ForConditionalGeneration, AutoTokenizer),
+    "falcon": (AutoModelForCausalLM, AutoTokenizer),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
     # "chatglm": (AutoModel, AutoTokenizer),
 }
@@ -175,9 +177,10 @@ print_rank0(f"*** Loading the model {model_name}")
 model_type = next((x for x in MODEL_CLASSES.keys() if x in model_name.lower()), 'auto')
 model_class = MODEL_CLASSES[model_type]
 tokenizer = model_class[1].from_pretrained(model_name)
-config = AutoConfig.from_pretrained(model_name, torchscript=args.jit)
+config = AutoConfig.from_pretrained(model_name, torchscript=args.jit, trust_remote_code=True)
 if not hasattr(config, "text_max_length") and args.prompt is None:
     config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
+print_rank0("model config:", config)
 
 # XXX: can't automatically derive dtype via config's `from_pretrained`
 # dtype = torch.bfloat16 if model_name in ["bigscience/bloom", "bigscience/bigscience-small-testing"] else torch.float16
@@ -193,15 +196,17 @@ if args.benchmark:
     gc.collect()
     deepspeed.runtime.utils.see_memory_usage("pre-from-pretrained", force=True)
 
+is_meta_support = not model_type in ["llama", "falcon"]
+
 # Construct model with fake meta tensors, later will be replaced during ds-inference ckpt load
-with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=model_type != "llama"):
+with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support):
     # Even inside the meta device context, from_pretrained still loads the
     # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
     # We add the instance type check here since some of the models haven't yet supported from_config.
-    if model_class[0] == AutoModelForCausalLM:
-        model = model_class[0].from_config(config, torch_dtype=load_dtype)
+    if model_class[0] == AutoModelForCausalLM and is_meta_support:
+        model = model_class[0].from_config(config, torch_dtype=load_dtype, trust_remote_code=True)
     else:
-        model = model_class[0].from_pretrained(model_name, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype, trust_remote_code=True)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
@@ -250,10 +255,9 @@ model = deepspeed.init_inference(
     mp_size=world_size,
     base_dir=repo_root,
     dtype=infer_dtype,
-    checkpoint=checkpoints_json if model_type != "llama" else None,
+    checkpoint=checkpoints_json if is_meta_support else None,
     **kwargs,
 )
-print_rank0("model config:", model.config)
 
 if args.benchmark:
     get_accelerator().empty_cache()
@@ -311,7 +315,7 @@ print_rank0("*** Prompt size: ", input_size)
 def generate():
     """returns a list of zipped inputs, outputs and number of new tokens"""
 
-    input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt")
+    input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt", return_token_type_ids=False)
     for t in input_tokens:
         if torch.is_tensor(input_tokens[t]):
             input_tokens[t] = input_tokens[t].to(get_accelerator().current_device_name())
