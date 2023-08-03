@@ -206,7 +206,7 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support
     if model_class[0] == AutoModelForCausalLM and is_meta_support:
         model = model_class[0].from_config(config, torch_dtype=load_dtype, trust_remote_code=True)
     else:
-        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype, trust_remote_code=True)
+        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
