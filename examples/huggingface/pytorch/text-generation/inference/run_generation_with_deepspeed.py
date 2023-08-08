@@ -206,7 +206,7 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=is_meta_support
     if model_class[0] == AutoModelForCausalLM and is_meta_support:
         model = model_class[0].from_config(config, torch_dtype=load_dtype, trust_remote_code=True)
     else:
-        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+        model = model_class[0].from_pretrained(model_name, config=config, low_cpu_mem_usage=True, torch_dtype=load_dtype, trust_remote_code=True)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
@@ -269,9 +269,10 @@ if args.benchmark:
 
 # to ipex
 if args.ipex:
-    args.greedy = True
     model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype)
-else:
+
+# bypass assertion for beam4
+if isinstance(model, deepspeed.InferenceEngine):
     model = model.module
 
 ### Generate
