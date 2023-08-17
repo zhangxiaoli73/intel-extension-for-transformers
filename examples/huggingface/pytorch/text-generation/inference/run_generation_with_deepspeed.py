@@ -105,6 +105,7 @@ def get_int_from_env(env_keys, default):
 local_rank = get_int_from_env(["LOCAL_RANK","MPI_LOCALRANKID"], "0")
 world_size = get_int_from_env(["WORLD_SIZE","PMI_SIZE"], "1")
 
+print("zl_debug ", get_accelerator().communication_backend_name())
 deepspeed.init_distributed(get_accelerator().communication_backend_name())
 x = torch.ones(
     [4, 1, 14336], device=torch.device("xpu", local_rank), dtype=torch.bfloat16
@@ -178,6 +179,7 @@ tokenizer = model_class[1].from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name, torchscript=args.jit)
 if not hasattr(config, "text_max_length") and args.prompt is None:
     config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
+print_rank0("model config:", config)
 
 # XXX: can't automatically derive dtype via config's `from_pretrained`
 # dtype = torch.bfloat16 if model_name in ["bigscience/bloom", "bigscience/bigscience-small-testing"] else torch.float16
@@ -199,13 +201,16 @@ with deepspeed.OnDevice(dtype=load_dtype, device="meta", enabled=model_type != "
     # model to cpu instead of meta device. Use from_config instead to solve the issue for big models.
     # We add the instance type check here since some of the models haven't yet supported from_config.
     if model_class[0] == AutoModelForCausalLM:
+        print("zl_debug model class is AutoModelForCausalLM from config")
         model = model_class[0].from_config(config, torch_dtype=load_dtype)
     else:
+        print("zl_debug model class is AutoModelForCausalLM from pretrained")
         model = model_class[0].from_pretrained(model_name, low_cpu_mem_usage=True, torch_dtype=load_dtype)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
 
+print_rank0("zl_debug: model structure from causal model", model)
 model = model.eval()
 model = model.to(memory_format=torch.channels_last)
 
@@ -254,6 +259,7 @@ model = deepspeed.init_inference(
     **kwargs,
 )
 print_rank0("model config:", model.config)
+print_rank0("zl_debug model structure after init_inference: ", model)
 
 if args.benchmark:
     get_accelerator().empty_cache()
@@ -269,6 +275,8 @@ if args.ipex:
     model = ipex.optimize_transformers(model.eval().to("xpu"), dtype=infer_dtype)
 else:
     model = model.module
+
+print_rank0("zl_debug model structure after ipex optimize_transformers: ", model)
 
 ### Generate
 print_rank0(f"*** Starting to generate {num_tokens} tokens with bs={args.batch_size}")
@@ -355,6 +363,8 @@ else:
     total_list = []
     # latency
     for i in range(cycles):
+        if i == 2:
+            os.environ["PTI_ENABLE_COLLECTION"] = "1"
         t0 = time.time()
         gen_ids, outputs = generate()
         if args.cuda:
@@ -369,6 +379,8 @@ else:
             total_time += (t1 - t0)
             if args.token_latency:
                 total_list.append(outputs[1])
+        if 'PTI_ENABLE_COLLECTION' in os.environ:
+            del os.environ['PTI_ENABLE_COLLECTION']
 
     latency = total_time / (cycles - warmup)
     print_rank0("\n", "-"*10, "Summary:", "-"*10)
