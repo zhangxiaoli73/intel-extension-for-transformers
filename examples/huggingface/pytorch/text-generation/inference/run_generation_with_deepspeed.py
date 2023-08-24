@@ -358,22 +358,27 @@ else:
     cycles = args.num_iter
     warmup = args.num_warmup
     total_list = []
-    # latency
-    for i in range(cycles):
-        t0 = time.time()
-        gen_ids, outputs = generate()
-        if args.cuda:
-            torch.cuda.synchronize()
-        t1 = time.time()
-        gen_ids = list(gen_ids)
-        print_rank0(gen_ids[0][1:])
-        print_rank0("Iteration: %d, Time: %.6f sec" % (i, t1 - t0))
-        # if model.config.model_type != 't5':
-        #     assert gen_ids[0][-1] == args.max_new_tokens, "Generated new tokens != max new tokens"
-        if i >= warmup:
-            total_time += (t1 - t0)
-            if args.token_latency:
-                total_list.append(outputs[1])
+    with torch.inference_mode(), torch.no_grad(), torch.autocast(
+            device_type=args.device,
+            enabled=True,
+            dtype=infer_dtype,
+    ):
+        # latency
+        for i in range(cycles):
+            t0 = time.time()
+            gen_ids, outputs = generate()
+            if args.cuda:
+                torch.cuda.synchronize()
+            t1 = time.time()
+            gen_ids = list(gen_ids)
+            print_rank0(gen_ids[0][1:])
+            print_rank0("Iteration: %d, Time: %.6f sec" % (i, t1 - t0))
+            # if model.config.model_type != 't5':
+            #     assert gen_ids[0][-1] == args.max_new_tokens, "Generated new tokens != max new tokens"
+            if i >= warmup:
+                total_time += (t1 - t0)
+                if args.token_latency:
+                    total_list.append(outputs[1])
 
     latency = total_time / (cycles - warmup)
     print_rank0("\n", "-"*10, "Summary:", "-"*10)
