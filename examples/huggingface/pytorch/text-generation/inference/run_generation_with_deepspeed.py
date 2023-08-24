@@ -55,9 +55,9 @@ parser.add_argument('-m', '--model-id',
 )
 parser.add_argument('--device',
     type=str,
-    choices=["cpu", "cuda"],
-    help="cpu or cuda, same as --cuda or not",
-    default='cpu',
+    choices=["cpu", "cuda", "xpu"],
+    help="cpu or cuda or xpu",
+    default='xpu',
 )
 parser.add_argument(
     "--dtype", type=str, help="float16 or bfloat16 or int8", choices=["int8", "float16", "bfloat16", "float32"], default="float16"
