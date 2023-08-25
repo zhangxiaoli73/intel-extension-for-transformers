@@ -107,11 +107,11 @@ def get_int_from_env(env_keys, default):
 local_rank = get_int_from_env(["LOCAL_RANK","MPI_LOCALRANKID"], "0")
 world_size = get_int_from_env(["WORLD_SIZE","PMI_SIZE"], "1")
 
-#deepspeed.init_distributed(get_accelerator().communication_backend_name())
-# x = torch.ones(
-#     [4, 1, 14336], device=torch.device("xpu", local_rank), dtype=torch.bfloat16
-# )
-# dist.all_reduce(x)
+deepspeed.init_distributed(get_accelerator().communication_backend_name())
+x = torch.ones(
+    [4, 1, 14336], device=torch.device("xpu", local_rank), dtype=torch.bfloat16
+)
+dist.all_reduce(x)
 
 def print_rank0(*msg):
     if local_rank != 0:
@@ -135,7 +135,7 @@ def get_repo_root(model_name_or_path):
             resume_download=True,
         )
 
-    #dist.barrier()
+    dist.barrier()
 
     return snapshot_download(
         model_name_or_path,
@@ -256,7 +256,7 @@ if tp_presharded_mode and kernel_inject:
 else:
     # for normal bloom repo we need to write the checkpoints config file
     write_checkpoints_json()
-    #dist.barrier()
+    dist.barrier()
 
 model = deepspeed.init_inference(
     model,
